@@ -192,6 +192,12 @@ class KotBotApp:
         self._video_preview_after_id = None
         self._photo_preview_after_id = None
         self._suspend_settings_events = False
+        self.video_batch_active = False
+        self.video_batch_queue = []
+        self.photo_batch_active = False
+        self.photo_batch_queue = []
+        self.last_output_file: Path | None = None
+        self._config_backup_done = False
 
         self.setup_vars()
         self.build_ui()
@@ -492,9 +498,22 @@ class KotBotApp:
         }
         data.update(self.collect_photo_config_values() if hasattr(self, "photo_filter_vars") else {})
         try:
+            self.backup_config_once()
             CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.log(f"Не удалось сохранить config.json: {exc}")
+            except Exception:
+                pass
+
+    def backup_config_once(self) -> None:
+        if self._config_backup_done or not CONFIG_PATH.exists():
+            return
+        backup_dir = DATA_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(CONFIG_PATH, backup_dir / f"config_{stamp}.json")
+        self._config_backup_done = True
 
     def build_ui(self) -> None:
         self.root.configure(bg="#f4f1ea")
@@ -576,6 +595,9 @@ class KotBotApp:
 
         self.photo_preview_area(right)
         self.photo_log_area(right)
+
+        self.root.bind("<Control-Return>", self.on_ctrl_enter_process, add="+")
+        self.root.bind("<Control-KP_Enter>", self.on_ctrl_enter_process, add="+")
 
     def folders_main_tab(self, parent: tk.Widget) -> None:
         outer = tk.Frame(parent, bg="#f4f1ea")
@@ -750,7 +772,7 @@ class KotBotApp:
         box = self.card(parent)
         box.pack(fill="x", pady=(0, 10))
 
-        tk.Button(
+        self.photo_process_btn = tk.Button(
             box,
             text="Обработать фото",
             command=self.process_photo_clicked,
@@ -761,7 +783,19 @@ class KotBotApp:
             font=("Segoe UI", 14, "bold"),
             height=2,
             relief="flat",
-        ).pack(fill="x", padx=10, pady=(10, 8))
+        )
+        self.photo_process_btn.pack(fill="x", padx=10, pady=(10, 6))
+        self.photo_process_all_btn = tk.Button(
+            box,
+            text="Обработать все фото из папки",
+            command=self.process_all_photos_from_folder_clicked,
+            bg="#eee6dc",
+            fg="#2e2924",
+            font=("Segoe UI", 10, "bold"),
+            height=1,
+            relief="flat",
+        )
+        self.photo_process_all_btn.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Progressbar(box, variable=self.photo_progress_var, maximum=100).pack(fill="x", padx=10, pady=(0, 4))
         tk.Label(box, textvariable=self.photo_status_var, bg="white", fg="#615950", font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -773,6 +807,7 @@ class KotBotApp:
         header.pack(fill="x", padx=14, pady=(10, 6))
         tk.Label(header, text="Предпросмотр фото", font=("Segoe UI", 14, "bold"), bg="white", fg="#28231f").pack(side="left")
         tk.Button(header, text="Обновить", command=self.update_photo_preview, bg="#eee6dc", relief="flat").pack(side="right")
+        tk.Button(header, text="Открыть готовый", command=self.open_last_output_file, bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
 
         preview_frame = tk.Frame(box, bg="#1f1f1f")
         preview_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -1312,6 +1347,29 @@ class KotBotApp:
         self.photo_watermark_cache_image = None
         self.photo_plaque_cache_path = None
         self.photo_plaque_cache_image = None
+
+
+    def on_ctrl_enter_process(self, _event=None):
+        tab = self.active_media_tab()
+        if tab == "photo":
+            self.process_photo_clicked()
+        else:
+            self.process_video_clicked()
+        return "break"
+
+    def open_last_output_file(self) -> None:
+        path = getattr(self, "last_output_file", None)
+        if not path or not Path(path).exists():
+            messagebox.showinfo(APP_NAME, "Готовый файл еще не создан или уже перемещен")
+            return
+        self.open_path(Path(path))
+
+    def reveal_last_output_file(self) -> None:
+        path = getattr(self, "last_output_file", None)
+        if not path or not Path(path).exists():
+            messagebox.showinfo(APP_NAME, "Готовый файл еще не создан или уже перемещен")
+            return
+        self.reveal_path_in_folder(Path(path))
 
     def settings_save_bar(self, parent: tk.Widget) -> None:
         box = tk.Frame(parent, bg="#f4f1ea")
@@ -2209,7 +2267,7 @@ class KotBotApp:
         ).pack(anchor="w", padx=12, pady=(4, 12))
 
     def process_button(self, parent: tk.Widget) -> None:
-        tk.Button(
+        self.video_process_btn = tk.Button(
             parent,
             text="Обработать видео",
             command=self.process_video_clicked,
@@ -2220,9 +2278,10 @@ class KotBotApp:
             relief="flat",
             activebackground="#bf5827",
             activeforeground="white",
-        ).pack(fill="x", pady=(0, 6))
+        )
+        self.video_process_btn.pack(fill="x", pady=(0, 6))
 
-        tk.Button(
+        self.video_process_all_btn = tk.Button(
             parent,
             text="Обработать все из папки",
             command=self.process_all_videos_from_folder_clicked,
@@ -2231,7 +2290,8 @@ class KotBotApp:
             fg="#2e2924",
             font=("Segoe UI", 10, "bold"),
             relief="flat",
-        ).pack(fill="x", pady=(0, 6))
+        )
+        self.video_process_all_btn.pack(fill="x", pady=(0, 6))
 
         self.progress_bar = ttk.Progressbar(parent, variable=self.progress_var, maximum=100, mode="determinate")
         self.progress_bar.pack(fill="x", pady=(0, 4))
@@ -2247,6 +2307,7 @@ class KotBotApp:
         tk.Label(top, text="Предпросмотр", font=("Segoe UI", 13, "bold"), bg="white", fg="#28231f").pack(side="left")
         tk.Button(top, text="🗑", command=self.move_selected_video_to_trash, bg="#eee6dc", relief="flat", width=3).pack(side="right", padx=(6, 0))
         tk.Button(top, text="Показать в папке", command=self.reveal_selected_video, bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
+        tk.Button(top, text="Открыть готовый", command=self.open_last_output_file, bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
         tk.Button(top, text="▶ видео", command=self.toggle_preview_play, bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
         tk.Button(top, text="Следующее", command=lambda: self.load_adjacent_video(1), bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
         tk.Button(top, text="Предыдущее", command=lambda: self.load_adjacent_video(-1), bg="#eee6dc", relief="flat").pack(side="right", padx=(6, 0))
@@ -3352,8 +3413,71 @@ class KotBotApp:
             self.log(f"Не удалось отправить видео в хлам: {exc}")
             messagebox.showerror(APP_NAME, f"Не удалось отправить видео в хлам:\n{exc}")
 
+
+    def set_video_processing_ui(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for name in ("video_process_btn", "video_process_all_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.configure(state=state)
+                except Exception:
+                    pass
+
+    def set_photo_processing_ui(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for name in ("photo_process_btn", "photo_process_all_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.configure(state=state)
+                except Exception:
+                    pass
+
+    def validate_media_before_processing(self, media: str, source: Path, settings: dict) -> list[str]:
+        errors = []
+        if not source or not Path(source).exists():
+            errors.append("исходный файл не найден")
+        output_dir = self.public_output_folder(media)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            probe = output_dir / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"нет доступа к папке готовых файлов: {exc}")
+        wm_key = "watermark_path"
+        plaque_key = "plaque_png_path"
+        if settings.get("watermark_enabled"):
+            wm = str(settings.get(wm_key, "")).strip()
+            if not wm or not Path(wm).exists():
+                errors.append("watermark включен, но файл не найден")
+        if settings.get("plaque_png_enabled"):
+            plaque = str(settings.get(plaque_key, "")).strip()
+            if not plaque or not Path(plaque).exists():
+                errors.append("PNG плашка включена, но файл не найден")
+        if media == "video" and settings.get("music_enabled"):
+            if self.resolve_music_track(settings) is None:
+                errors.append("музыка включена, но трек не найден")
+        return errors
+
+    def append_history(self, item: dict) -> None:
+        try:
+            history = DATA_DIR / "history.jsonl"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            item = dict(item)
+            item.setdefault("date", time.strftime("%Y-%m-%d %H:%M:%S"))
+            with history.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            try:
+                self.log(f"Не удалось записать историю: {exc}")
+            except Exception:
+                pass
+
     def process_video_clicked(self) -> None:
         if self.processing:
+            self.log("Повторный запуск видео проигнорирован: обработка уже идет")
             messagebox.showinfo(APP_NAME, "Видео уже обрабатывается")
             return
         if not self.selected_video:
@@ -3363,10 +3487,17 @@ class KotBotApp:
             return
 
         self.worker_settings = self.collect_settings(randomize=True)
+        errors = self.validate_media_before_processing("video", self.selected_video, self.worker_settings)
+        if errors:
+            msg = "Проверь перед обработкой:\n- " + "\n- ".join(errors)
+            self.log(msg.replace("\n", " | "))
+            messagebox.showerror(APP_NAME, msg)
+            return
         self.worker_watermark_image = self.load_watermark_image(self.worker_settings)
         self.worker_plaque_image = self.load_plaque_image(self.worker_settings)
         self.progress_var.set(0)
         self.processing = True
+        self.set_video_processing_ui(True)
         self.preview_playing = False
         self.close_preview_cap()
         thread = threading.Thread(target=self.process_video_worker, daemon=True)
@@ -3450,17 +3581,21 @@ class KotBotApp:
 
             self.safe_progress(100)
             self.move_source_if_safe(source)
+            self.last_output_file = output
+            self.append_history({"type": "video", "public": self.selected_public_name("video"), "source": str(source), "output": str(output), "caption": self.worker_settings.get("caption", "") if self.worker_settings else "", "music": str(self.resolve_music_track(self.worker_settings)) if self.worker_settings and self.resolve_music_track(self.worker_settings) else "", "scale": self.worker_settings.get("video_scale", 100) if self.worker_settings else 100, "error": ""})
             self.safe_log(f"Готово: {output}")
             self.safe_status("Готово")
             if not getattr(self, "video_batch_active", False):
                 self.root.after(0, lambda: messagebox.showinfo(APP_NAME, f"Готовое видео сохранено:\n{output}"))
         except Exception as exc:
             err = str(exc)
+            self.append_history({"type": "video", "public": self.selected_public_name("video"), "source": str(source), "output": "", "caption": self.worker_settings.get("caption", "") if self.worker_settings else "", "music": "", "scale": self.worker_settings.get("video_scale", 100) if self.worker_settings else 100, "error": err})
             self.safe_log(f"Ошибка: {err}")
             self.safe_status("Ошибка обработки")
             self.root.after(0, lambda e=err: messagebox.showerror(APP_NAME, f"Ошибка обработки:\n{e}"))
         finally:
             self.processing = False
+            self.set_video_processing_ui(False)
             self.worker_watermark_image = None
             self.worker_plaque_image = None
             self.root.after(0, self.after_processing_refresh)
@@ -4304,8 +4439,41 @@ class KotBotApp:
                 used[key] = final
         settings["photo_random_used"] = used
 
+
+    def source_photo_files(self) -> list[Path]:
+        return sorted([p for p in PATHS["source_photos"].iterdir() if p.suffix.lower() in PHOTO_EXTS])
+
+    def process_all_photos_from_folder_clicked(self) -> None:
+        if self.photo_processing:
+            messagebox.showinfo(APP_NAME, "Фото уже обрабатывается")
+            return
+        files = self.source_photo_files()
+        if not files:
+            messagebox.showinfo(APP_NAME, "В папке исходников фото пока нет файлов")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Обработать все фото из папки?\nФайлов: {len(files)}\nПаблик: {self.selected_public_name('photo')}"):
+            return
+        self.photo_batch_queue = list(files)
+        self.photo_batch_active = True
+        self.process_next_photo_in_batch()
+
+    def process_next_photo_in_batch(self) -> None:
+        queue = getattr(self, "photo_batch_queue", [])
+        if not queue:
+            self.photo_batch_queue = []
+            self.photo_batch_active = False
+            self.photo_status_var.set("Пакетная обработка фото завершена")
+            self.photo_log("Пакетная обработка фото завершена")
+            self.load_first_photo_from_folder(silent=True)
+            return
+        self.selected_photo = queue.pop(0)
+        self.photo_label_var.set(self.selected_photo.name)
+        self.photo_log(f"Пакет фото: осталось после текущего {len(queue)}")
+        self.process_photo_clicked()
+
     def process_photo_clicked(self) -> None:
         if self.photo_processing:
+            self.photo_log("Повторный запуск фото проигнорирован: обработка уже идет")
             messagebox.showinfo(APP_NAME, "Фото уже обрабатывается")
             return
         if not self.selected_photo:
@@ -4314,10 +4482,17 @@ class KotBotApp:
             messagebox.showinfo(APP_NAME, "Положи фото в папку исходников или выбери его кнопкой")
             return
         self.photo_worker_settings = self.collect_photo_settings(randomize=True)
+        errors = self.validate_media_before_processing("photo", self.selected_photo, self.photo_worker_settings)
+        if errors:
+            msg = "Проверь перед обработкой:\n- " + "\n- ".join(errors)
+            self.photo_log(msg.replace("\n", " | "))
+            messagebox.showerror(APP_NAME, msg)
+            return
         self.photo_worker_watermark_image = self.load_photo_watermark_image(self.photo_worker_settings)
         self.photo_worker_plaque_image = self.load_photo_plaque_image(self.photo_worker_settings)
         self.photo_progress_var.set(0)
         self.photo_processing = True
+        self.set_photo_processing_ui(True)
         thread = threading.Thread(target=self.process_photo_worker, daemon=True)
         thread.start()
 
@@ -4358,21 +4533,31 @@ class KotBotApp:
             self.photo_safe_progress(92)
             self.move_photo_source_if_safe(source)
             self.photo_safe_progress(100)
+            self.last_output_file = output
+            self.append_history({"type": "photo", "public": self.selected_public_name("photo"), "source": str(source), "output": str(output), "caption": self.photo_worker_settings.get("caption", "") if self.photo_worker_settings else "", "music": "", "scale": "", "error": ""})
             self.photo_safe_log(f"Готово фото: {output}")
             self.photo_safe_status("Фото готово")
             self.root.after(0, lambda: messagebox.showinfo(APP_NAME, f"Готовое фото сохранено:\n{output}"))
         except Exception as exc:
             err = str(exc)
+            self.append_history({"type": "photo", "public": self.selected_public_name("photo"), "source": str(source), "output": "", "caption": self.photo_worker_settings.get("caption", "") if self.photo_worker_settings else "", "music": "", "scale": "", "error": err})
             self.photo_safe_log(f"Ошибка фото: {err}")
             self.photo_safe_status("Ошибка обработки фото")
             self.root.after(0, lambda e=err: messagebox.showerror(APP_NAME, f"Ошибка обработки фото:\n{e}"))
         finally:
             self.photo_processing = False
+            self.set_photo_processing_ui(False)
             self.photo_worker_watermark_image = None
             self.photo_worker_plaque_image = None
             self.root.after(0, self.after_photo_processing_refresh)
 
     def after_photo_processing_refresh(self) -> None:
+        if getattr(self, "photo_batch_queue", None):
+            self.selected_photo = None
+            self.current_photo_bgr = None
+            self.photo_label_var.set("Фото не выбрано")
+            self.root.after(250, self.process_next_photo_in_batch)
+            return
         self.selected_photo = None
         self.current_photo_bgr = None
         self.photo_label_var.set("Фото не выбрано")
